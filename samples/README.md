@@ -2,6 +2,9 @@ Generated-By: Claude Sonnet 4
 
 # Sample etcd Snapshot for Testing octosql
 
+> [!WARNING]  
+> Everything in this directory is AI-generated. The code runs and the sample queries work with the sample data (for the most part), but don't expect the generated etcd snapshot to match what you'd get out of a real OpenShift/K8s cluster.
+
 This directory contains tools and examples for testing octosql with etcd snapshots using the `octosql-plugin-etcdsnapshot` plugin.
 
 ## Contents
@@ -73,18 +76,28 @@ The sample etcd snapshot contains typical Kubernetes objects and custom data:
 
 Here are some example queries you can run against the sample snapshot:
 
+> **💡 Important Syntax Notes:**
+> - `key` is a reserved keyword in octosql, so always use a table alias like `d.key`
+> - When running queries in bash/docker, use double quotes around the SQL and escape inner quotes properly
+> - Use single quotes for string literals in SQL (e.g., `'/registry/pods/%'`)
+
 ### 1. List all keys in the snapshot
 ```sql
-SELECT key FROM etcdsnapshot ORDER BY key;
+SELECT d.key FROM etcd.snapshot d ORDER BY d.key;
+```
+
+**Command line example:**
+```bash
+octosql "SELECT d.key FROM etcd.snapshot d ORDER BY d.key"
 ```
 
 ### 2. Count objects by type
 ```sql
 SELECT 
-    SPLIT_PART(key, '/', 3) as resource_type,
+    SUBSTR(d.key, 11) as resource_type,
     COUNT(*) as count
-FROM etcdsnapshot 
-WHERE key LIKE '/registry/%' 
+FROM etcd.snapshot d
+WHERE d.key LIKE '/registry/%' 
 GROUP BY resource_type 
 ORDER BY count DESC;
 ```
@@ -92,63 +105,64 @@ ORDER BY count DESC;
 ### 3. Find all pods
 ```sql
 SELECT 
-    key,
-    JSON_EXTRACT(value, '$.metadata.name') as pod_name,
-    JSON_EXTRACT(value, '$.metadata.namespace') as namespace,
-    JSON_EXTRACT(value, '$.status.phase') as phase
-FROM etcdsnapshot 
-WHERE key LIKE '/registry/pods/%';
+    d.key,
+    name as pod_name,
+    namespace,
+    value
+FROM etcd.snapshot d
+WHERE d.key LIKE '/registry/pods/%' AND name IS NOT NULL;
+```
+
+**Command line example:**
+```bash
+octosql "SELECT d.key, name as pod_name, namespace FROM etcd.snapshot d WHERE d.key LIKE '/registry/pods/%' AND name IS NOT NULL"
 ```
 
 ### 4. List services and their types
 ```sql
 SELECT 
-    JSON_EXTRACT(value, '$.metadata.name') as service_name,
-    JSON_EXTRACT(value, '$.metadata.namespace') as namespace,
-    JSON_EXTRACT(value, '$.spec.type') as service_type
-FROM etcdsnapshot 
-WHERE key LIKE '/registry/services/%';
+    name as service_name,
+    namespace,
+    value
+FROM etcd.snapshot d
+WHERE d.key LIKE '/registry/services/%' AND name IS NOT NULL;
 ```
 
 ### 5. Find secrets by type
 ```sql
 SELECT 
-    JSON_EXTRACT(value, '$.metadata.name') as secret_name,
-    JSON_EXTRACT(value, '$.metadata.namespace') as namespace,
-    JSON_EXTRACT(value, '$.type') as secret_type
-FROM etcdsnapshot 
-WHERE key LIKE '/registry/secrets/%';
+    name as secret_name,
+    namespace,
+    value
+FROM etcd.snapshot d
+WHERE d.key LIKE '/registry/secrets/%' AND name IS NOT NULL;
 ```
 
 ### 6. Analyze custom application data
 ```sql
 SELECT 
-    key,
-    JSON_EXTRACT(value, '$.database_url') as db_url,
-    JSON_EXTRACT(value, '$.max_connections') as max_conn
-FROM etcdsnapshot 
-WHERE key LIKE '/custom/apps/%';
+    d.key,
+    value
+FROM etcd.snapshot d
+WHERE d.key LIKE '/custom/apps/%';
 ```
 
 ### 7. Monitor metrics data
 ```sql
 SELECT 
-    JSON_EXTRACT(value, '$.timestamp') as timestamp,
-    JSON_EXTRACT(value, '$.value') as cpu_value,
-    JSON_EXTRACT(value, '$.unit') as unit,
-    JSON_EXTRACT(value, '$.node') as node
-FROM etcdsnapshot 
-WHERE key LIKE '/custom/metrics/%';
+    d.key,
+    value
+FROM etcd.snapshot d
+WHERE d.key LIKE '/custom/metrics/%';
 ```
 
 ### 8. Feature flag analysis
 ```sql
 SELECT 
-    SPLIT_PART(key, '/', 4) as feature_name,
-    JSON_EXTRACT(value, '$.enabled') as enabled,
-    JSON_EXTRACT(value, '$.rollout_percentage') as rollout_pct
-FROM etcdsnapshot 
-WHERE key LIKE '/custom/feature-flags/%';
+    SPLIT_PART(d.key, '/', 4) as feature_name,
+    value
+FROM etcd.snapshot d
+WHERE d.key LIKE '/custom/feature-flags/%';
 ```
 
 ## Using octosql Interactive Mode
@@ -165,8 +179,9 @@ docker run -it -v $(pwd)/samples:/samples:Z etcd-sre-tools bash
 # Navigate to samples and run queries
 cd /samples
 
-# Run individual queries
+# Run individual queries (note the table alias 'd' for accessing key column)
 octosql "SELECT COUNT(*) FROM etcd.snapshot"
+octosql "SELECT d.key, name, namespace FROM etcd.snapshot d LIMIT 5"
 octosql "SELECT * FROM etcd.snapshot LIMIT 5" --describe
 ```
 
@@ -174,59 +189,55 @@ octosql "SELECT * FROM etcd.snapshot LIMIT 5" --describe
 
 ### Join data across different object types
 ```sql
--- Find pods and their corresponding services
+-- Find pods and their corresponding services by namespace
 SELECT 
-    p.pod_name,
+    p.name as pod_name,
     p.namespace,
-    s.service_name
-FROM (
-    SELECT 
-        JSON_EXTRACT(value, '$.metadata.name') as pod_name,
-        JSON_EXTRACT(value, '$.metadata.namespace') as namespace,
-        JSON_EXTRACT(value, '$.metadata.labels.app') as app_label
-    FROM etcdsnapshot 
-    WHERE key LIKE '/registry/pods/%'
-) p
-LEFT JOIN (
-    SELECT 
-        JSON_EXTRACT(value, '$.metadata.name') as service_name,
-        JSON_EXTRACT(value, '$.metadata.namespace') as namespace,
-        JSON_EXTRACT(value, '$.spec.selector.app') as selector_app
-    FROM etcdsnapshot 
-    WHERE key LIKE '/registry/services/%'
-) s ON p.app_label = s.selector_app AND p.namespace = s.namespace;
+    s.name as service_name
+FROM etcd.snapshot p
+LEFT JOIN etcd.snapshot s 
+    ON p.namespace = s.namespace 
+    AND p.key LIKE '/registry/pods/%' 
+    AND s.key LIKE '/registry/services/%'
+WHERE p.key LIKE '/registry/pods/%' 
+    AND p.name IS NOT NULL;
 ```
 
 ### Audit namespaces and their resources
 ```sql
--- Count resources per namespace
+-- Count resources per namespace using pre-parsed columns
 SELECT 
-    SPLIT_PART(key, '/', 4) as namespace,
-    SPLIT_PART(key, '/', 3) as resource_type,
+    namespace,
+    resourceType,
     COUNT(*) as resource_count
-FROM etcdsnapshot 
-WHERE key LIKE '/registry/%/%/%' 
-GROUP BY namespace, resource_type 
+FROM etcd.snapshot d
+WHERE d.key LIKE '/registry/%' 
+    AND namespace IS NOT NULL 
+    AND resourceType IS NOT NULL
+GROUP BY namespace, resourceType 
 ORDER BY namespace, resource_count DESC;
 ```
 
 ## Tips for Using octosql with etcd Snapshots
 
-1. **Use JSON functions**: etcd stores Kubernetes objects as JSON, so leverage `JSON_EXTRACT()` heavily
-2. **Filter with LIKE**: Use pattern matching to filter by resource types or namespaces
-3. **Use SPLIT_PART()**: Extract parts of the etcd key hierarchy for grouping and analysis
-4. **Save results**: You can output query results to CSV or JSON for further analysis
-5. **Explore incrementally**: Start with simple queries and build up complexity
+1. **Use table aliases for key column**: Since `key` is reserved, always use an alias: `SELECT d.key FROM etcd.snapshot d`
+2. **Use pre-parsed columns**: The etcd plugin parses JSON data into structured columns like `name`, `namespace`, `resourceType` - use these instead of parsing JSON manually
+3. **Quote escaping in bash**: Use double quotes around SQL and single quotes for string literals: `octosql "SELECT d.key FROM etcd.snapshot d WHERE d.key LIKE '/registry/pods/%'"`
+4. **Filter with LIKE**: Use pattern matching to filter by resource types or namespaces
+5. **Use pre-parsed columns**: The etcd plugin provides structured columns like `namespace`, `resourceType` - use these instead of parsing keys manually
+6. **Save results**: You can output query results to CSV or JSON for further analysis
+7. **Explore incrementally**: Start with simple queries and build up complexity
+8. **Check for NULL values**: Use `WHERE name IS NOT NULL` to filter out entries without names
 
 ## Troubleshooting
 
 If you encounter issues:
 
-1. **Plugin not found**: Ensure the `octosql-plugin-etcdsnapshot` plugin is in the plugin directory (`/usr/local/lib/octosql/plugins/`)
+1. **Plugin not found**: Ensure the `octosql-plugin-etcd.snapshot` plugin is in the plugin directory (`/usr/local/lib/octosql/plugins/`)
 2. **File extension configuration**: The file extension handler is pre-configured in the container. If you need to verify it exists:
    ```bash
    cat ~/.octosql/file_extension_handlers.json
-   # Should show: {"snapshot": "etcdsnapshot"}
+   # Should show: {"snapshot": "etcd.snapshot"}
    ```
 3. **Snapshot file**: Ensure the snapshot file has the `.snapshot` extension and exists:
    ```bash
@@ -235,10 +246,11 @@ If you encounter issues:
 4. **Query errors**: Start with simple queries to understand the data structure:
    ```bash
    octosql "SELECT * FROM etcd.snapshot LIMIT 1" --describe
+   octosql "SELECT d.key, name, namespace FROM etcd.snapshot d LIMIT 5"
    ```
 5. **Plugin verification**: Check that the plugin is properly installed:
    ```bash
-   ls -la /usr/local/lib/octosql/plugins/octosql-plugin-etcdsnapshot
+   ls -la /usr/local/lib/octosql/plugins/octosql-plugin-etcd.snapshot
    ```
 6. **Performance**: For large snapshots, use `LIMIT` clauses while developing queries
 7. **SELinux permission issues**: If you're on RHEL, Fedora, or CentOS and getting permission denied errors, use the `:Z` flag:
@@ -249,26 +261,4 @@ If you encounter issues:
 
 ## SELinux Systems
 
-If you're running on a system with SELinux enabled (Red Hat Enterprise Linux, Fedora, CentOS), you need to use the `:Z` flag when mounting volumes to ensure proper security context labeling:
-
-```bash
-# Standard Docker command for SELinux systems
-docker run -it -v $(pwd)/samples:/samples:Z etcd-sre-tools
-
-# This applies the correct SELinux context to allow container access
-```
-
-**Why is this needed?**
-- SELinux enforces mandatory access controls
-- Container processes run in a confined security context
-- The `:Z` flag tells Docker to apply the appropriate SELinux labels
-- Without it, you'll get "Permission denied" errors even with correct file permissions
-
-## Real-world Usage
-
-This sample demonstrates how you can use octosql to:
-- Audit Kubernetes cluster configuration
-- Analyze resource distribution across namespaces
-- Debug cluster issues by querying etcd directly
-- Generate reports on cluster resource usage
-- Monitor application-specific data stored in etcd 
+If you're running on a system with SELinux enabled (Red Hat Enterprise Linux, Fedora, CentOS), you need to use the `
