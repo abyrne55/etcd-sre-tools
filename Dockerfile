@@ -26,8 +26,22 @@ RUN OCTOSQL_VERSION=$(curl -s https://api.github.com/repos/cube2222/octosql/rele
     chmod +x /usr/local/bin/octosql && \
     rm -rf /tmp/octosql*
 
+# Install octosql-plugin-etcdsnapshot
+# Download and install the etcd snapshot plugin
+RUN mkdir -p /usr/local/lib/octosql/plugins && \
+    PLUGIN_VERSION=$(curl -s https://api.github.com/repos/tjungblu/octosql-plugin-etcdsnapshot/releases/latest | grep '"tag_name"' | cut -d'"' -f4) && \
+    curl -L -o /tmp/octosql-plugin-etcdsnapshot.tar.gz "https://github.com/tjungblu/octosql-plugin-etcdsnapshot/releases/download/${PLUGIN_VERSION}/octosql-plugin-etcdsnapshot_${PLUGIN_VERSION#v}_linux_amd64.tar.gz" && \
+    tar -xzf /tmp/octosql-plugin-etcdsnapshot.tar.gz -C /tmp && \
+    mv /tmp/octosql-plugin-etcdsnapshot /usr/local/lib/octosql/plugins/ && \
+    chmod +x /usr/local/lib/octosql/plugins/octosql-plugin-etcdsnapshot && \
+    rm -rf /tmp/octosql-plugin-etcdsnapshot*
+
 # Verify installation
 RUN octosql --version
+
+# Configure octosql file extension handlers for etcd snapshots
+RUN mkdir -p /root/.octosql && \
+    echo '{"snapshot": "etcdsnapshot"}' > /root/.octosql/file_extension_handlers.json
 
 # Set the default command to shell
 CMD ["/bin/bash"] 
