@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""
+Natural Language etcd Analysis CLI
+A CLI tool that allows users to analyze etcd snapshots using natural language queries.
+"""
+
+import asyncio
+import json
+import sys
+import os
+import subprocess
+import re
+from typing import Dict, List, Optional, Any
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich.table import Table
+from rich.text import Text
+from rich.spinner import Spinner
+from rich.live import Live
+import httpx
+
+console = Console()
+app = typer.Typer(help="Natural Language etcd Snapshot Analysis Tool")
+
+class EtcdAnalyzer:
+    def __init__(self):
+        self.llama_url = "http://localhost:8080"
+        self.model = "SmolLM2-1.7B-Instruct-Q4_K_M"
+        self.mcp_client_path = "/usr/local/bin/etcd-mcp-client"
+        
+    async def query_llm(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """Query the local LLM with a given prompt."""
+        try:
+            # First check if llama.cpp server is available
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                try:
+                    health_response = await client.get(f"{self.llama_url}/health")
+                    health_response.raise_for_status()
+                except Exception:
+                    console.print("[yellow]⚠️  llama.cpp server not ready yet. Continuing without LLM analysis...[/yellow]")
+                    return ""
+            
+            system_msg = system_prompt or self._get_system_prompt()
+            
+            # Format the prompt for SmolLM2-Instruct chat template
+            formatted_prompt = f"<|im_start|>system\n{system_msg}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+            
+            payload = {
+                "prompt": formatted_prompt,
+                "max_tokens": 1024,
+                "temperature": 0.3,
+                "top_p": 0.9,
+                "stop": ["<|im_end|>"],
+                "stream": False
+            }
+            
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(f"{self.llama_url}/completion", json=payload)
+                response.raise_for_status()
+                result = response.json()
+                return result.get("content", "").strip()
+                
+        except Exception as e:
+            console.print(f"[yellow]⚠️  LLM not available: {e}[/yellow]")
+            console.print("[dim]Continuing with basic SQL analysis...[/dim]")
+            return ""
+    
+    def _get_system_prompt(self) -> str:
+        """Get the system prompt for the LLM."""
+        return """You are an expert etcd and Kubernetes cluster analysis assistant. Your job is to help users analyze etcd snapshots using natural language queries.
+
+Available analysis capabilities:
+- List and analyze Kubernetes resources (pods, services, configmaps, secrets, etc.)
+- Show resource counts and distributions
+- Analyze cluster health and metadata
+- Find largest objects by size
+- Compare resource states
+- Search for specific resources or patterns
+
+When a user asks a question about etcd analysis, you should:
+1. Understand what they want to analyze
+2. Suggest the appropriate SQL query using octosql syntax for etcd snapshots
+3. Explain what the query will show
+4. Provide helpful insights about the results
+
+Remember that etcd snapshots contain Kubernetes cluster state data. Common queries involve:
+- SELECT * FROM etcd.snapshot WHERE resourceType='pods'
+- SELECT namespace, COUNT(*) FROM etcd.snapshot GROUP BY namespace
+- SELECT key, valueSize FROM etcd.snapshot ORDER BY valueSize DESC LIMIT 10
+
+Always be helpful and provide clear, actionable SQL queries that users can run."""
+
+    def parse_natural_language_query(self, query: str) -> Dict[str, Any]:
+        """Parse a natural language query and extract intent and parameters."""
+        query_lower = query.lower()
+        
+        # Define common patterns
+        patterns = {
+            "list_pods": r"(show|list|find).*pods?",
+            "list_services": r"(show|list|find).*services?",
+            "list_configmaps": r"(show|list|find).*configmaps?",
+            "list_secrets": r"(show|list|find).*secrets?",
+            "count_resources": r"(count|how many).*",
+            "largest_objects": r"(largest|biggest|size).*",
+            "namespace_filter": r"in\s+(namespace\s+)?['\"]?([a-z0-9-]+)['\"]?",
+            "cluster_health": r"(health|status|cluster).*",
+            "resource_by_name": r"(named|called)\s+['\"]?([a-z0-9-]+)['\"]?",
+        }
+        
+        intent = "general_query"
+        params = {}
+        
+        for pattern_name, pattern in patterns.items():
+            if re.search(pattern, query_lower):
+                intent = pattern_name
+                break
+        
+        # Common English words to filter out when extracting parameters
+        common_words = {"the", "a", "an", "and", "or", "but", "by", "for", "with", "from", "to", "of", "in", "on", "at"}
+        
+        # Extract namespace if mentioned (but avoid common English words)
+        namespace_match = re.search(patterns["namespace_filter"], query_lower)
+        if namespace_match:
+            namespace = namespace_match.group(2)
+            if namespace not in common_words and len(namespace) > 1:
+                params["namespace"] = namespace
+            
+        # Extract resource name if mentioned (but avoid common English words)
+        name_match = re.search(patterns["resource_by_name"], query_lower)
+        if name_match:
+            name = name_match.group(2)
+            if name not in common_words and len(name) > 1:
+                params["name"] = name
+            
+        return {"intent": intent, "params": params, "original_query": query}
+
+    def generate_sql_query(self, parsed_query: Dict[str, Any]) -> str:
+        """Generate an SQL query based on parsed natural language input."""
+        intent = parsed_query["intent"]
+        params = parsed_query["params"]
+        
+        # Base queries for different intents (note: 'key' is escaped as it's a SQL reserved word)
+        queries = {
+            "list_pods": "SELECT namespace, name, \"key\" FROM etcd.snapshot WHERE resourceType='pods'",
+            "list_services": "SELECT namespace, name, \"key\" FROM etcd.snapshot WHERE resourceType='services'",
+            "list_configmaps": "SELECT namespace, name, \"key\" FROM etcd.snapshot WHERE resourceType='configmaps'",
+            "list_secrets": "SELECT namespace, name, \"key\" FROM etcd.snapshot WHERE resourceType='secrets'",
+            "count_resources": "SELECT resourceType, COUNT(*) as count FROM etcd.snapshot GROUP BY resourceType ORDER BY count DESC",
+            "largest_objects": "SELECT \"key\", valueSize, resourceType FROM etcd.snapshot ORDER BY valueSize DESC LIMIT 10",
+            "cluster_health": "SELECT * FROM etcd.snapshot LIMIT 20",
+            "general_query": "SELECT \"key\", namespace, name, resourceType, valueSize FROM etcd.snapshot LIMIT 10"
+        }
+        
+        base_query = queries.get(intent, queries["general_query"])
+        
+        # Parse the query to properly insert WHERE clauses
+        return self._insert_where_clauses(base_query, params)
+    
+    def _insert_where_clauses(self, query: str, params: Dict[str, Any]) -> str:
+        """Properly insert WHERE clauses before ORDER BY/GROUP BY/LIMIT."""
+        if not params:
+            return query
+            
+        # Split query into parts
+        query_upper = query.upper()
+        
+        # Find positions of ORDER BY, GROUP BY, LIMIT
+        order_pos = query_upper.find(" ORDER BY")
+        group_pos = query_upper.find(" GROUP BY") 
+        limit_pos = query_upper.find(" LIMIT")
+        
+        # Find the earliest position where we need to insert WHERE clause
+        split_pos = len(query)
+        for pos in [order_pos, group_pos, limit_pos]:
+            if pos != -1 and pos < split_pos:
+                split_pos = pos
+        
+        # Split the query
+        if split_pos < len(query):
+            main_part = query[:split_pos]
+            tail_part = query[split_pos:]
+        else:
+            main_part = query
+            tail_part = ""
+        
+        # Build WHERE conditions
+        conditions = []
+        
+        if "namespace" in params:
+            conditions.append(f"namespace='{params['namespace']}'")
+            
+        if "name" in params:
+            conditions.append(f"name LIKE '%{params['name']}%'")
+        
+        if not conditions:
+            return query
+            
+        # Add WHERE clause
+        if "WHERE" in main_part.upper():
+            # Already has WHERE, add AND conditions
+            where_clause = " AND " + " AND ".join(conditions)
+            main_part += where_clause
+        else:
+            # No WHERE clause, add one
+            where_clause = " WHERE " + " AND ".join(conditions)
+            main_part += where_clause
+            
+        return main_part + tail_part
+
+    async def execute_sql_query(self, sql_query: str, snapshot_path: str) -> str:
+        """Execute an SQL query against an etcd snapshot using MCP client."""
+        try:
+            # Replace the placeholder with the actual snapshot path (if it hasn't been replaced already)
+            final_query = sql_query.replace("etcd.snapshot", snapshot_path)
+            
+            # Use the MCP client to execute the query
+            cmd = [self.mcp_client_path, "query", final_query, snapshot_path]
+            
+            # Execute the command
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            
+            if result.returncode != 0:
+                return f"Error executing MCP query: {result.stderr}"
+            
+            # Parse the JSON response from MCP client
+            try:
+                mcp_response = json.loads(result.stdout)
+                if mcp_response.get("success"):
+                    return mcp_response.get("result", "No results")
+                else:
+                    return f"MCP Error: {mcp_response.get('error', 'Unknown error')}"
+            except json.JSONDecodeError:
+                # Fallback to raw output if not JSON
+                return result.stdout
+                
+        except subprocess.TimeoutExpired:
+            return "Query timeout - the query took too long to execute"
+        except Exception as e:
+            return f"Error executing query: {str(e)}"
+
+    async def analyze_query_results(self, query: str, results: str) -> str:
+        """Use the LLM to analyze and explain query results."""
+        analysis_prompt = f"""
+The user asked: "{query}"
+
+The SQL query returned the following results:
+{results}
+
+Please provide a clear, helpful analysis of these results. Explain what they mean in the context of the etcd/Kubernetes cluster. If there are any patterns, issues, or interesting findings, highlight them.
+"""
+        
+        return await self.query_llm(analysis_prompt)
+
+    async def process_natural_language_query(self, query: str, snapshot_path: str) -> Dict[str, str]:
+        """Process a complete natural language query workflow."""
+        console.print(f"[blue]Analyzing query:[/blue] {query}")
+        
+        # Parse the query
+        parsed = self.parse_natural_language_query(query)
+        console.print(f"[dim]Intent detected: {parsed['intent']}[/dim]")
+        
+        # Generate SQL and replace placeholder with actual snapshot path
+        sql_query = self.generate_sql_query(parsed)
+        final_sql_query = sql_query.replace("etcd.snapshot", snapshot_path)
+        console.print(f"[green]Generated SQL:[/green] {final_sql_query}")
+        
+        # Execute query
+        with console.status("Executing query..."):
+            results = await self.execute_sql_query(sql_query, snapshot_path)
+        
+        # Analyze results with LLM if results aren't too long
+        analysis = ""
+        if len(results) < 5000:  # Only analyze if results are manageable
+            with console.status("Analyzing results..."):
+                analysis = await self.analyze_query_results(query, results)
+        
+        return {
+            "sql_query": final_sql_query,
+            "results": results,
+            "analysis": analysis
+        }
+
+@app.command()
+def interactive(
+    snapshot: str = typer.Option(None, "--snapshot", "-s", help="Path to etcd snapshot file"),
+    model: str = typer.Option("SmolLM2-1.7B-Instruct-Q4_K_M", "--model", "-m", help="LLM model to use")
+):
+    """Start interactive natural language etcd analysis session."""
+    
+    if not snapshot:
+        # Look for snapshot files in common locations
+        possible_snapshots = [
+            "etcd.snapshot",
+            "/snapshots/etcd.snapshot",
+            "/data/etcd.snapshot"
+        ]
+        
+        for path in possible_snapshots:
+            if os.path.exists(path):
+                snapshot = path
+                break
+        
+        if not snapshot:
+            console.print("[red]No etcd snapshot found. Please specify with --snapshot[/red]")
+            console.print("Usage: nl-etcd-cli interactive --snapshot /path/to/etcd.snapshot")
+            return
+    
+    if not os.path.exists(snapshot):
+        console.print(f"[red]Snapshot file not found: {snapshot}[/red]")
+        return
+    
+    analyzer = EtcdAnalyzer()
+    analyzer.model = model
+    
+    console.print(Panel.fit(
+        "[bold green]Natural Language etcd Analysis Tool[/bold green]\n"
+        f"Snapshot: {snapshot}\n"
+        f"Model: {model}\n\n"
+        "[dim]Ask questions about your etcd snapshot in plain English![/dim]",
+        title="🎯 etcd Analyzer"
+    ))
+    
+    console.print("\n[yellow]Example queries:[/yellow]")
+    examples = [
+        "Show me all pods in the kube-system namespace",
+        "What are the 10 largest objects in the cluster?",
+        "Count all resources by type",
+        "List all ConfigMaps",
+        "Show cluster health metrics",
+        "Find services named 'api'"
+    ]
+    for example in examples:
+        console.print(f"  • {example}")
+    
+    console.print("\n[dim]Type 'exit' or 'quit' to exit, 'help' for more examples[/dim]\n")
+    
+    while True:
+        try:
+            query = Prompt.ask("[bold blue]🤔 Your question")
+            
+            if query.lower() in ['exit', 'quit', 'q']:
+                console.print("👋 Goodbye!")
+                break
+            elif query.lower() in ['help', 'h']:
+                show_help()
+                continue
+            elif not query.strip():
+                continue
+            
+            # Process the query
+            asyncio.run(handle_query(analyzer, query, snapshot))
+            
+        except KeyboardInterrupt:
+            console.print("\n👋 Goodbye!")
+            break
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+
+async def handle_query(analyzer: EtcdAnalyzer, query: str, snapshot: str):
+    """Handle a single query processing."""
+    try:
+        result = await analyzer.process_natural_language_query(query, snapshot)
+        
+        # Display results
+        console.print("\n" + "="*60)
+        
+        # Show SQL query
+        console.print(Panel(
+            result["sql_query"],
+            title="🔍 Generated SQL Query",
+            border_style="blue"
+        ))
+        
+        # Show raw results
+        if result["results"]:
+            # Format results nicely if they look like a table
+            if "|" in result["results"] and "+" in result["results"]:
+                # It's already formatted as a table
+                console.print("\n[bold yellow]📊 Query Results:[/bold yellow]")
+                console.print(result["results"])
+            else:
+                console.print(Panel(
+                    result["results"],
+                    title="📊 Query Results",
+                    border_style="green"
+                ))
+        
+        # Show LLM analysis if available
+        if result["analysis"]:
+            console.print(Panel(
+                Markdown(result["analysis"]),
+                title="🧠 AI Analysis",
+                border_style="magenta"
+            ))
+        
+        console.print("="*60 + "\n")
+        
+    except Exception as e:
+        console.print(f"[red]Error processing query: {e}[/red]")
+
+def show_help():
+    """Show help information."""
+    console.print(Panel(
+        """[bold]Available Query Types:[/bold]
+
+🔍 [blue]Resource Listing:[/blue]
+  • "Show me all pods"
+  • "List services in namespace default"
+  • "Find ConfigMaps named mysql"
+
+📊 [blue]Counting & Statistics:[/blue]
+  • "Count all resources by type"
+  • "How many pods are in each namespace?"
+
+📏 [blue]Size Analysis:[/blue]
+  • "What are the largest objects?"
+  • "Show me objects larger than 1MB"
+
+🏥 [blue]Cluster Health:[/blue]
+  • "Show cluster health metrics"
+  • "What's the overall cluster status?"
+
+💡 [blue]Tips:[/blue]
+  • Be specific about namespaces when possible
+  • Use natural language - the AI will understand
+  • Ask follow-up questions to dive deeper
+  • Type 'exit' to quit
+""",
+        title="❓ Help",
+        border_style="cyan"
+    ))
+
+@app.command()
+def query(
+    question: str = typer.Argument(..., help="Natural language question about the etcd snapshot"),
+    snapshot: str = typer.Option("etcd.snapshot", "--snapshot", "-s", help="Path to etcd snapshot file"),
+    model: str = typer.Option("SmolLM2-1.7B-Instruct-Q4_K_M", "--model", "-m", help="LLM model to use")
+):
+    """Ask a single question about an etcd snapshot."""
+    
+    if not os.path.exists(snapshot):
+        console.print(f"[red]Snapshot file not found: {snapshot}[/red]")
+        return
+    
+    analyzer = EtcdAnalyzer()
+    analyzer.model = model
+    
+    asyncio.run(handle_query(analyzer, question, snapshot))
+
+@app.command()
+def models():
+    """Show information about the loaded LLM model."""
+    try:
+        model_path = os.environ.get("LLAMA_MODEL_PATH", "/usr/local/models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf")
+        
+        console.print("[bold green]Model Information:[/bold green]")
+        console.print(f"Model: SmolLM2-1.7B-Instruct")
+        console.print(f"Quantization: Q4_K_M (4-bit)")
+        console.print(f"Size: ~1GB")
+        console.print(f"Context Length: 8192 tokens")
+        console.print(f"Path: {model_path}")
+        
+        # Check if model file exists
+        if os.path.exists(model_path):
+            size = os.path.getsize(model_path) / (1024**3)  # Convert to GB
+            console.print(f"File Size: {size:.2f} GB")
+            console.print("Status: ✅ Ready")
+        else:
+            console.print("Status: ❌ Model file not found")
+            
+        # Check server status
+        try:
+            import httpx
+            import asyncio
+            
+            async def check_server():
+                try:
+                    async with httpx.AsyncClient(timeout=2.0) as client:
+                        response = await client.get("http://localhost:8080/health")
+                        return response.status_code == 200
+                except:
+                    return False
+            
+            server_running = asyncio.run(check_server())
+            if server_running:
+                console.print("Server: ✅ Running on port 8080")
+            else:
+                console.print("Server: ⭕ Not running")
+        except:
+            console.print("Server: ❓ Status unknown")
+            
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+
+if __name__ == "__main__":
+    app() 

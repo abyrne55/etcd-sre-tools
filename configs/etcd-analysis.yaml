@@ -1,0 +1,79 @@
+# etcd Analysis Tool Configuration
+
+# LLM Configuration
+llm:
+  model: "SmolLM2-1.7B-Instruct-Q4_K_M.gguf"
+  model_source: "bartowski/SmolLM2-1.7B-Instruct-GGUF"
+  quantization: "Q4_K_M"
+  temperature: 0.3
+  max_tokens: 1024
+  timeout: 120
+  context_length: 8192
+
+# MCP Configuration
+mcp:
+  server_command: ["octosql", "plugin", "serve", "etcdsnapshot"]
+  timeout: 120
+  tools:
+    - analyze_etcd_snapshot
+    - query_etcd_resources
+    - get_cluster_metadata
+
+# Default snapshot locations to search
+default_snapshots:
+  - "etcd.snapshot"
+  - "/snapshots/etcd.snapshot" 
+  - "/data/etcd.snapshot"
+  - "/var/lib/etcd/member/snap/db"
+  - "samples/etcd.snapshot"
+
+# Query templates for common analysis patterns
+query_templates:
+  list_pods: "SELECT namespace, name, key FROM {snapshot} WHERE resourceType='pods'"
+  list_services: "SELECT namespace, name, key FROM {snapshot} WHERE resourceType='services'"
+  list_configmaps: "SELECT namespace, name, key FROM {snapshot} WHERE resourceType='configmaps'"
+  list_secrets: "SELECT namespace, name, key FROM {snapshot} WHERE resourceType='secrets'"
+  count_resources: "SELECT resourceType, COUNT(*) as count FROM {snapshot} GROUP BY resourceType ORDER BY count DESC"
+  largest_objects: "SELECT key, valueSize, resourceType FROM {snapshot} ORDER BY valueSize DESC LIMIT 10"
+  cluster_health: "SELECT * FROM {snapshot}?meta=true"
+  namespace_resources: "SELECT resourceType, COUNT(*) as count FROM {snapshot} WHERE namespace='{namespace}' GROUP BY resourceType"
+
+# Natural language processing patterns
+nl_patterns:
+  list_resources:
+    - "show.*pods?"
+    - "list.*pods?"
+    - "find.*pods?"
+    - "get.*pods?"
+  count_resources:
+    - "count.*"
+    - "how many.*"
+    - "number of.*"
+  size_analysis:
+    - "largest.*"
+    - "biggest.*"
+    - "size.*"
+    - ".*bytes"
+  health_check:
+    - "health.*"
+    - "status.*"
+    - "cluster.*"
+  namespace_filter:
+    - "in namespace.*"
+    - "namespace.*"
+    - "ns.*"
+
+# Output formatting
+output:
+  table_max_width: 120
+  truncate_long_values: true
+  max_value_length: 100
+  show_query_explanation: true
+  show_execution_time: true
+
+# Offline mode configuration
+offline:
+  model_cache_dir: "/usr/local/models"
+  preload_models: ["smollm2:1.7b"]
+  disable_updates: true
+  local_only: true 
