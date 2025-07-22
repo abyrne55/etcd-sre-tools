@@ -133,12 +133,6 @@ The Q4_K_M quantization provides the best balance of quality and performance for
 - **Stop tokens**: Properly formatted for chat template
 - **Timeout**: 120 seconds (generous for CPU inference)
 
-### Health Check
-
-```bash
-docker run --rm etcd-sre-tools /usr/local/bin/health-check.sh
-```
-
 ### Offline Setup
 
 ```bash
@@ -172,7 +166,6 @@ docker run --rm etcd-sre-tools /usr/local/bin/setup-offline.sh
 ├── llama-server         # llama.cpp server binary
 ├── llama-cli            # llama.cpp CLI binary
 ├── startup.sh           # Container startup script
-├── health-check.sh      # Health verification script
 └── setup-offline.sh     # Offline configuration script
 
 /usr/local/models/
@@ -217,9 +210,6 @@ The repository includes sample etcd snapshots in the `samples/` directory:
 ### Debugging
 
 ```bash
-# Check component status
-docker run --rm etcd-sre-tools /usr/local/bin/health-check.sh
-
 # Test octosql directly
 docker run --rm -v ./samples:/snapshots etcd-sre-tools \
     octosql "SELECT COUNT(*) FROM /snapshots/etcd.snapshot"
@@ -274,5 +264,5 @@ Feel free to submit issues and enhancement requests!
 For issues related to:
 - etcd analysis: Check octosql documentation
 - LLM responses: Verify prompts in `/etc/etcd-analysis/prompts.yaml`
-- Container issues: Check logs and health-check script
+- Container issues: Check logs and container startup
 - Performance: Monitor CPU/memory usage and consider quantization options
